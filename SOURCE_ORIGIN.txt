@@ -1,0 +1,6 @@
+Upstream: https://github.com/DarkIzuku/bloodborne_pc
+Base commit: 8ecba9a4abdd54747e31d7fee54982e422b5f8e2
+Snapshot date: 2026-10-20
+Local modifications included. Original copyright notices retained.
+Vendored submodule sources retain their own licenses.
+Original game data, personal saves, logs, proprietary binaries, game artwork and unlicensed community patch data are excluded.

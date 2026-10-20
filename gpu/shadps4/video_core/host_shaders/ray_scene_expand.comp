@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x=64) in;
+layout(buffer_reference,std430,buffer_reference_align=16) readonly buffer Clips {vec4 p[];};
+layout(buffer_reference,std430,buffer_reference_align=4) readonly buffer Indices {uint p[];};
+struct Draw {uvec4 allocation;uvec4 shape;uvec4 span;};
+layout(binding=0,std430) readonly buffer References {Draw draws[];};
+layout(binding=1,std430) readonly buffer Cameras {vec4 cameras[];};
+layout(binding=2,std430) writeonly buffer World {vec4 vertices[];};
+layout(push_constant) uniform Parameters {uint64_t clip_address;uint count;uint num_draws;};
+void main(){
+ uint i=gl_GlobalInvocationID.x;if(i>=count)return;
+ uint lo=0,hi=num_draws;
+ while(lo+1<hi){uint mid=(lo+hi)/2;if(draws[mid].span.x<=i)lo=mid;else hi=mid;}
+ Draw draw=draws[lo];uint b=lo*4;
+ uint n=i-draw.span.x,instance=n/draw.shape.x,element=n%draw.shape.x;
+ uint64_t address=uint64_t(draw.span.y)|(uint64_t(draw.span.z)<<32);
+ uint vertex=element+draw.allocation.y;
+ if(address!=0){
+  uint offset=uint(address&3ul)+element*draw.shape.z;
+  uint packed=Indices(address&~3ul).p[offset/4];
+  uint idx=draw.shape.z==2?(packed>>((offset&2u)*8u))&65535u:packed;
+  vertex=idx+draw.shape.y;
+ }
+ bool valid=vertex>=draw.allocation.y && vertex-draw.allocation.y<draw.allocation.z;
+ uint ref=draw.allocation.x+instance*draw.allocation.z+(valid?vertex-draw.allocation.y:0);
+ vec4 c=valid?Clips(clip_address).p[ref]:vec4(0);
+ vec4 pr=cameras[b+3];
+ vec4 v=vec4(c.x/pr.x,c.y/pr.y,c.w,1);
+ vec3 w=vec3(dot(cameras[b],v),dot(cameras[b+1],v),dot(cameras[b+2],v));
+ // Invalid vertex payload produces an inactive, degenerate triangle.
+ if(!valid || any(isnan(c)) || any(isinf(c)) || any(isnan(w)) || any(isinf(w)))w=vec3(0);
+ vertices[i]=vec4(w,1);
+}

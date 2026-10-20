@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: native HDR output (hdr_mode=native, docs/hdr.md). The game tonemaps its linear HDR
+// scene into an 8-bit SDR frame. These passes measure how much brighter than that frame its own
+// scene is where the game's curve compressed the highlights, as a gain map the HDR encode
+// (hdr_output.frag) multiplies the finished SDR frame (UI included) with:
+//   LUMA      before the post-processing combine: the scene color's brightest channel at half
+//             size, the 2x2 maximum (highlights) and that of the 2x2 average (exposure).
+//   STATS     the exposure statistics: log2(SDR / scene) over the SDR midtones (bloom's outliers
+//             weighted down), one sum per group; with SNAPSHOT also a copy of the tonemapped
+//             frame before the first UI pass.
+//   EXPOSURE  one group: the sums added up, the exposure smoothed over frames.
+//   GAIN      at the display pass: the gain per pixel of the finished frame.
+// The midtones keep the SDR picture exactly (gain 1 below the knee); the game's look (grading,
+// contrast, vignette, fog colour) stays, only the highlights get brighter.
+
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+float Max3(vec3 c) {
+    return max(c.r, max(c.g, c.b));
+}
+
+// As hdr_output.frag: the game's picture is made for SDR displays, which show it with 2.2.
+vec3 SdrToLinear(vec3 c) {
+    return pow(max(c, vec3(0.0)), vec3(2.2));
+}
+
+// What the game's curve does to the midtones, as log2(SDR linear / scene).
+struct Exposure {
+    float log_scale; // smoothed over frames
+    float valid;     // 1 once measured
+    float samples;   // midtone samples of the last measurement (debugging)
+    float frames;    // measurements so far
+};
+
+#if defined(LUMA)
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D scene_tex;
+layout(binding = 1, rg16f) uniform writeonly image2D luma_img;
+
+void main() {
+    const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(texel, imageSize(luma_img)))) {
+        return;
+    }
+    const ivec2 last = textureSize(scene_tex, 0) - 1;
+    float peak = 0.0;
+    vec3 sum = vec3(0.0);
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            vec3 c = texelFetch(scene_tex, min(texel * 2 + ivec2(x, y), last), 0).rgb;
+            // A NaN from an effect must not spread; an overflow (inf) is just very bright.
+            c = clamp(mix(c, vec3(0.0), isnan(c)), vec3(0.0), vec3(65504.0));
+            peak = max(peak, Max3(c));
+            sum += c;
+        }
+    }
+    imageStore(luma_img, texel, vec4(peak, Max3(sum * 0.25), 0.0, 0.0));
+}
+
+#elif defined(STATS)
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform texture2D frame_tex; // UNORM view: the display-encoded values
+layout(binding = 1) uniform texture2D luma_tex;
+layout(std430, binding = 2) writeonly buffer Partials {
+    vec4 partials[]; // per group: weighted sum of log2(SDR / scene), weights, samples
+};
+layout(std430, binding = 3) readonly buffer State {
+    Exposure exposure;
+};
+#ifdef SNAPSHOT
+layout(binding = 4, rgba8) uniform writeonly image2D snapshot_img;
+#endif
+layout(push_constant) uniform Params {
+    uint reset; // the last exposure is stale (no measurement last frame)
+};
+
+// SDR midtones (linear brightest channel): above the toe of the game's curve, below its
+// shoulder, where it is close to a plain exposure.
+const float MID_LOW = 0.02;
+const float MID_HIGH = 0.45;
+// Bloom and glare light up SDR midtones around lamps where the scene is dark: samples far from
+// the last exposure (in stops) count less. A uniform shift (a new area, the eye adapting) moves
+// all samples alike and the weighted mean follows it.
+const float SPREAD = 1.0;
+
+shared vec3 group_sums[256];
+
+void main() {
+    const ivec2 size = textureSize(frame_tex, 0);
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    vec3 sample_sum = vec3(0.0);
+    if (all(lessThan(pixel, size))) {
+        const vec4 c = texelFetch(frame_tex, pixel, 0);
+#ifdef SNAPSHOT
+        // Bit for bit (8-bit values in and out): the display pass finds the UI as any change.
+        imageStore(snapshot_img, pixel, c);
+#endif
+        const float sdr = Max3(SdrToLinear(c.rgb));
+        const ivec2 luma_size = textureSize(luma_tex, 0);
+        const ivec2 at = min(ivec2((vec2(pixel) + 0.5) * vec2(luma_size) / vec2(size)),
+                             luma_size - 1);
+        const float scene = texelFetch(luma_tex, at, 0).g;
+        if (sdr >= MID_LOW && sdr <= MID_HIGH && scene > 1e-5) {
+            const float stops = clamp(log2(sdr / scene), -32.0, 32.0);
+            const float off = reset == 0u && exposure.valid > 0.0
+                                  ? (stops - exposure.log_scale) / SPREAD
+                                  : 0.0;
+            const float weight = exp(-0.5 * off * off) + 1e-6;
+            sample_sum = vec3(stops * weight, weight, 1.0);
+        }
+    }
+    const uint index = gl_LocalInvocationIndex;
+    group_sums[index] = sample_sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (index < stride) {
+            group_sums[index] += group_sums[index + stride];
+        }
+        barrier();
+    }
+    if (index == 0u) {
+        partials[gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x] =
+            vec4(group_sums[0], 0.0);
+    }
+}
+
+#elif defined(EXPOSURE)
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Partials {
+    vec4 partials[];
+};
+layout(std430, binding = 1) buffer State {
+    Exposure exposure;
+};
+layout(push_constant) uniform Params {
+    uint count;        // groups of the STATS pass
+    uint reset;        // no measurement last frame: take this one as it is
+    float min_samples; // fewer midtone samples (a dark or white frame): keep the last value
+    float rate;        // smoothing per frame
+};
+
+shared vec3 sums[256];
+
+void main() {
+    const uint index = gl_LocalInvocationIndex;
+    vec3 sum = vec3(0.0);
+    for (uint i = index; i < count; i += 256u) {
+        sum += partials[i].xyz;
+    }
+    sums[index] = sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (index < stride) {
+            sums[index] += sums[index + stride];
+        }
+        barrier();
+    }
+    if (index != 0u) {
+        return;
+    }
+    const vec3 total = sums[0];
+    exposure.samples = total.z;
+    if (total.z >= min_samples && total.y > 0.0) {
+        const float measured = total.x / total.y;
+        exposure.log_scale = reset != 0u || exposure.valid == 0.0
+                                 ? measured
+                                 : mix(exposure.log_scale, measured, rate);
+        exposure.valid = 1.0;
+        exposure.frames += 1.0;
+    } else if (reset != 0u) {
+        // Back from menus or loading with too little to measure: no stale exposure.
+        exposure.valid = 0.0;
+    }
+}
+
+#elif defined(GAIN)
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D frame_tex;    // the finished frame (UI included)
+layout(binding = 1) uniform texture2D snapshot_tex; // the same before the first UI pass
+layout(binding = 2) uniform texture2D luma_tex;
+layout(std430, binding = 3) readonly buffer State {
+    Exposure exposure;
+};
+layout(binding = 4, r16f) uniform writeonly image2D gain_img;
+
+layout(push_constant) uniform Params {
+    float strength; // share of the scene's highlight range, in log2 (0: SDR, 1: all of it)
+    float white;    // peak / paper white: the most a pixel may reach (SDR white = 1)
+    float knee;     // linear brightest channel of the SDR frame where the gain starts
+    float unused;
+};
+
+// Unchanged up to halfway between SDR white and the peak, then towards the peak with the same
+// slope there: highlights above the display's range keep some gradation instead of clipping.
+float SoftCap(float x, float limit) {
+    const float start = 0.5 * (1.0 + limit);
+    if (x <= start) {
+        return x;
+    }
+    const float room = limit - start;
+    return start + room * (1.0 - exp(-(x - start) / room));
+}
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = imageSize(gain_img);
+    if (any(greaterThanEqual(pixel, size))) {
+        return;
+    }
+    const vec3 finished = texelFetch(frame_tex, pixel, 0).rgb;
+    const vec3 before_ui = texelFetch(snapshot_tex, pixel, 0).rgb;
+    // UI: whatever the UI passes changed (HUD, menus, subtitles, their translucent backgrounds).
+    const float ui = smoothstep(0.5 / 255.0, 2.5 / 255.0, Max3(abs(finished - before_ui)));
+    float gain = 1.0;
+    const float sdr = Max3(SdrToLinear(before_ui));
+    const float ramp = smoothstep(knee, 1.0, sdr);
+    if (exposure.valid > 0.0 && ramp > 0.0 && white > 1.0) {
+        // The brightest scene pixel of the 2x2 luma texels around (4x4 scene pixels): the
+        // highlight's footprint does not shimmer with the upscalers' sub-pixel jitter or the
+        // resampling between the scene and this frame (scaled presets).
+        const ivec2 luma_size = textureSize(luma_tex, 0);
+        const vec2 at = (vec2(pixel) + 0.5) * vec2(luma_size) / vec2(size) - 0.5;
+        const ivec2 base = ivec2(floor(at));
+        float peak = 0.0;
+        for (int y = 0; y < 2; ++y) {
+            for (int x = 0; x < 2; ++x) {
+                const ivec2 texel = clamp(base + ivec2(x, y), ivec2(0), luma_size - 1);
+                peak = max(peak, texelFetch(luma_tex, texel, 0).r);
+            }
+        }
+        // The scene's brightness on the SDR frame's scale, as the midtones are shown. Bloom and
+        // glare are in the SDR frame only: where it is brighter than the scene, gain stays 1.
+        const float scene = exp2(exposure.log_scale) * peak;
+        const float ratio = scene / max(sdr, 1e-4);
+        if (ratio > 1.0) {
+            const float target = SoftCap(sdr * exp2(strength * ramp * log2(ratio)), white);
+            gain = max(target / max(sdr, 1e-4), 1.0);
+        }
+    }
+    gain = mix(gain, 1.0, ui);
+    // Negative where UI was found (for the debug view); the encode uses the magnitude.
+    imageStore(gain_img, pixel, vec4(ui >= 0.5 ? -gain : gain, 0.0, 0.0, 0.0));
+}
+
+#endif
