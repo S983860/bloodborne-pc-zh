@@ -9,6 +9,30 @@ ASSETS=ENGINE/'assets'
 LOGS=ROOT/'logs'
 CREATE_NO_WINDOW=0x08000000
 
+_notice_library=None
+
+def confirm_notice():
+    """Native notice also protects direct script entry, before hardware/settings."""
+    global _notice_library
+    path=ENGINE/'bb-startup-notice.dll'
+    if not path.is_file():
+        raise RuntimeError('免费项目提示组件缺失，请恢复完整的 engine 文件夹。')
+    # Keep the library loaded: it holds this session's event until game exit.
+    _notice_library=ctypes.WinDLL(str(path))
+    confirm=_notice_library.BBConfirmStartupNotice
+    confirm.argtypes=[];confirm.restype=ctypes.c_int
+    result=confirm()
+    if result not in (0,1):
+        raise RuntimeError('免费项目提示未能正常完成，已停止启动。')
+    if result==1:
+        owner=_notice_library.BBStartupNoticeOwnerPid
+        owner.argtypes=[];owner.restype=ctypes.c_ulong
+        pid=owner()
+        if not pid:raise RuntimeError('免费项目提示确认已失效，已停止启动。')
+        # SetEnvironmentVariableW in the DLL does not refresh Python's cached environ.
+        os.environ['BB_NOTICE_OWNER_PID']=str(pid)
+    return result==1
+
 def display_size():
     """Read the primary desktop mode in physical pixels, independent of Windows DPI scaling."""
     from ctypes import wintypes as w
@@ -41,6 +65,9 @@ def display_size():
 
 def environment():
     env={k:v for k,v in os.environ.items() if not k.startswith(('BB_','VK_','RESHADE_'))}
+    # Forward the live per-launch event owner after confirm_notice().
+    # The engine independently checks that process and event; a plain flag is insufficient.
+    env['BB_NOTICE_OWNER_PID']=os.environ.get('BB_NOTICE_OWNER_PID','')
     env.update(json.loads((ENGINE/'defaults/environment.json').read_text(encoding='utf8')))
     env.update(BB_DATA_DIR=str(ROOT),BB_GAME_DIR=str(GAME),BB_USER_DIR=str(ROOT/'user'),BB_CONFIG=str(CONFIG),
                BB_MODS_ENABLED='0',BB_PC_MENU_ASSETS=str(ASSETS/'menus'),
@@ -82,6 +109,7 @@ def main():
     parser.add_argument('--prepare-only',action='store_true')
     parser.add_argument('--profile',choices=('3k','4k'))
     options=parser.parse_args()
+    if not confirm_notice():return 0
     LOGS.mkdir(exist_ok=True)
     kernel=ctypes.WinDLL('kernel32',use_last_error=True)
     kernel.CreateMutexW.argtypes=[ctypes.c_void_p,ctypes.c_bool,ctypes.c_wchar_p];kernel.CreateMutexW.restype=ctypes.c_void_p

@@ -9,8 +9,11 @@
 #endif
 #include <windows.h>
 #include <wchar.h>
+#include "startup_notice.h"
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE previous,PWSTR arguments,int show) {
     (void)instance;(void)previous;(void)show;
+    int notice=bb_notice_confirm(1);
+    if(notice<=0)return notice==0?0:1;
     wchar_t root[32768],python[32768],command[32768];
     DWORD n=GetModuleFileNameW(NULL,root,32768);
     if(!n||n>=32768)return 2;

@@ -132,6 +132,8 @@ fi
 gpu_inputs=(out/gpu/libbbgpu.a out/gpu/bbgpu_link.txt)
 if [[ -n $windows ]]; then
     # Game/settings paths can contain Chinese on a portable installation.
+    "$CC" -std=c11 -O2 -Wall -Wextra -Werror -shared -Isrc tools/startup_notice.c -luser32 -o out/bb-startup-notice.dll
+    "$CC" -std=c11 -O2 -Wall -Wextra -Werror -municode -mwindows -Isrc tools/portable_entry.c -luser32 -o out/bloodborne-entry.exe
     if [[ ! -f out/windows-utf8.o || tools/engine/windows_utf8.manifest -nt out/windows-utf8.o ||
           tools/engine/windows_utf8.rc -nt out/windows-utf8.o ]]; then
         windres -I tools/engine tools/engine/windows_utf8.rc -O coff -o out/windows-utf8.o

@@ -810,6 +810,7 @@ void runtime_restart(void) {
 #ifdef _WIN32
 /* The guest main thread needs a large committed stack (PS4 code does not touch guard pages
  * in order), so the loader runs on a thread of its own; the process main thread waits. */
+#include "startup_notice.h"
 static int loader_main(int argc, char **argv);
 static int main_argc;
 static char **main_argv;
@@ -819,6 +820,9 @@ static unsigned __stdcall loader_thread(void *unused) {
     return (unsigned)loader_main(main_argc, main_argv);
 }
 int main(int argc, char **argv) {
+    // Check before CPU/GPU inventory, crash workers or loading game data.
+    int notice = bb_notice_confirm(0);
+    if (notice <= 0) return notice == 0 ? 0 : 1;
     timeBeginPeriod(1); /* 1 ms waits for timed locks and sleeps outside runtime_sleep_ns */
     /* No EcoQoS: Windows 11 otherwise moves the threads of an unfocused window to efficiency
      * cores (hybrid CPUs), and the GPU command thread sets the frame rate. */
