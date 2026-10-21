@@ -12,6 +12,8 @@ static const wchar_t bb_notice_text[] =
     L"作者：灰灰（呆呆）\n"
     L"交流群：721775768\n"
     L"发现倒卖的请及时联系作者。\n\n"
+    L"关注抖音 43396406929，或 B 站“水生郁”，\n"
+    L"获取最快更新进度。谢谢大家！\n\n"
     L"项目地址：\nhttps://github.com/S983860/bloodborne-pc-zh\n\n"
     L"原版游戏资源不属于本项目的开源内容。\n"
     L"开源代码的使用与分发遵循仓库许可证。\n\n"
